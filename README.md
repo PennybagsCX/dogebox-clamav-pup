@@ -4,6 +4,8 @@
 
 **[ClamAV](https://www.clamav.net) antivirus scanner packaged as a [Dogebox](https://dogebox.org) pup** — defense-in-depth on top of qBittorrent's bubblewrap sandbox. Watches every pup's downloads/ in real time via inotify, plus an hourly scheduled full sweep. Infected files are quarantined to `/storage/quarantine` (chmod 000) so Radarr/Sonarr's `DownloadedMoviesScan`/`DownloadedEpisodesScan` never imports them. Signature DB updates automatically via `freshclam` 4×/day. WebUI status page on port 9000.
 
+> **Latest:** v0.0.2 — hardened auto-update: smart bootstrap (sync only when DB is missing or >24h old), `/storage/config/freshclam.status` JSON for status observation, color-coded freshness badge in the WebUI (ok/stale/critical/unknown), and failsafe behavior when outbound to `database.clamav.net` is blocked.
+
 > ⚖️ ClamAV catches known signatures (most consumer-grade torrent malware, Windows EXE/LNK/RTF, malicious Office macros, common ZIPs). It's **not** a sandbox and won't stop zero-days — pair with the qBittorrent pup's bubblewrap sandbox for layered defense.
 
 ## Install
@@ -50,9 +52,28 @@ sudo rm /opt/dogebox/pups/storage/<...>/quarantine/file.quarantine
 
 `http://<box>:<clamav-web-port>/` (dogebox maps a 10000-range port; check the pup card on the dashboard for the exact number).
 
-- `/` — HTML status page with heartbeat + recent quarantine events
-- `/json` — raw JSON status (heartbeat timestamp, watch dirs, quarantine count)
+- `/` — HTML status page with **signature DB freshness badge** (color-coded), heartbeat, and recent quarantine events. When freshness status is `stale` or `critical`, a warning panel explains the likely cause + remediation.
+- `/json` — raw JSON status (heartbeat timestamp, watch dirs, quarantine count, freshclam section)
+- `/freshclam` — raw JSON of `/storage/config/freshclam.status` (status + db_age_seconds + last timestamps)
 - `/raw?lines=200` — last 200 lines of the quarantine log
+
+## Auto-update behavior (v0.0.2+)
+
+The pup runs `freshclam` as a long-running daemon (`Checks=4` ≈ 4×/day), but on startup it does one of two things:
+
+- **First boot, or DB >24h old:** runs a synchronous 60s-timeout `freshclam` to bootstrap the signature DB. Bounded so an outbound block doesn't hang the pup for hours.
+- **Otherwise:** starts the daemon immediately in the background. Skips the sync run, ~30s faster on every reboot.
+
+Either way, `/storage/config/freshclam.status` is written with `{status, last_successful_update_iso, last_attempt_iso, db_age_seconds}` and refreshed every 5 minutes. Status values:
+
+| Status | DB age | Meaning | WebUI color |
+|---|---|---|---|
+| `ok` | <48h | Signatures up to date | green |
+| `stale` | 48–72h | Last update > 2 days ago; freshclam likely failed | amber |
+| `critical` | >72h | Signatures very stale; outbound likely blocked | red |
+| `unknown` | n/a | No DB on disk yet | gray |
+
+**Failsafe on outbound block:** if the bootstrap sync fails (e.g. box is LAN-only), clamd still starts with whatever DB is present, the scanner falls back to `clamscan` mode, and the badge surfaces the freshness state so you can fix outbound at your leisure.
 
 ## Performance
 

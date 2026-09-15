@@ -1,0 +1,70 @@
+{
+  "manifestVersion": 1,
+  "meta": {
+    "name": "ClamAV",
+    "version": "0.0.1",
+    "logoPath": "logo.png",
+    "shortDescription": "Antivirus scanner with quarantine",
+    "longDescription": "ClamAV pup for Dogebox: inotify-based real-time scan + hourly full scan of qBittorrent and *arr download dirs. Infected files are quarantined to /storage/quarantine, a status page is served at the WebUI, and signature DB updates via freshclam.",
+    "upstreamVersions": {
+      "ClamAV": "1.x"
+    }
+  },
+  "config": {
+    "sections": null
+  },
+  "container": {
+    "build": {
+      "nixFile": "pup.nix",
+      "nixFileSha256": "470f5a76b01d2235b90f29b07b36deb07193df10d62d5f82d8b1e8167248a9ee"
+    },
+    "services": [
+      {
+        "name": "clamav-daemon",
+        "command": {
+          "exec": "/bin/run-clamd.sh",
+          "cwd": "",
+          "env": null
+        }
+      },
+      {
+        "name": "clamav-scanner",
+        "command": {
+          "exec": "/bin/run-scanner.sh",
+          "cwd": "",
+          "env": null
+        }
+      },
+      {
+        "name": "clamav-freshclam",
+        "command": {
+          "exec": "/bin/run-freshclam.sh",
+          "cwd": "",
+          "env": null
+        }
+      },
+      {
+        "name": "clamav-webui",
+        "command": {
+          "exec": "/bin/run-webui.sh",
+          "cwd": "",
+          "env": null
+        }
+      }
+    ],
+    "exposes": [
+      {
+        "name": "web",
+        "type": "http",
+        "port": 9000,
+        "interfaces": null,
+        "listenOnHost": true,
+        "webUI": true
+      }
+    ],
+    "requiresInternet": true
+  },
+  "interfaces": null,
+  "dependencies": null,
+  "metrics": null
+}

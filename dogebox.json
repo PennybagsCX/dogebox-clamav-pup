@@ -1,0 +1,6 @@
+{
+  "id": "dts.pups.clamav",
+  "name": "dts — clamav",
+  "description": "clamav malware scanner pup for Dogebox (inotify + scheduled + quarantine + webUI)",
+  "pups": [{"location": "clamav"}]
+}

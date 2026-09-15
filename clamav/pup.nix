@@ -59,11 +59,22 @@ let
 
     $MKDIR -p "$QUARANTINE"
 
-    # Build watch list from /opt/dogebox/pups/storage/*/downloads
+    # Build watch list from /opt/dogebox/pups/storage/*/downloads AND any
+    # media/downloads subdir (the Samba share exposes media/downloads as
+    # the user-writable destination from native Mac apps).
     WATCH_DIRS=""
     if [ -d /storage/config/watched ]; then
       for d in /storage/config/watched/*/; do
         [ -d "$d" ] && WATCH_DIRS="$WATCH_DIRS $d"
+      done
+      # Also include the Samba pup's media/downloads and media/inbox if present.
+      # The Samba pup has no top-level downloads/, so the simple /watched/*/ loop
+      # above misses it — explicitly check for media/{downloads,inbox,documents,torrents}.
+      for pup in /storage/config/watched/*/; do
+        [ -d "$pup" ] || continue
+        for sub in downloads inbox documents torrents; do
+          [ -d "$pup/media/$sub" ] && WATCH_DIRS="$WATCH_DIRS $pup/media/$sub"
+        done
       done
     fi
     $ECHO "scanner watch dirs: $WATCH_DIRS"

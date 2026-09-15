@@ -67,12 +67,12 @@ let
       for d in /storage/config/watched/*/; do
         [ -d "$d" ] && WATCH_DIRS="$WATCH_DIRS $d"
       done
-      # Also include the Samba pup's media/downloads and media/inbox if present.
+      # Also include the Samba pup's media/{downloads,documents,torrents} if present.
       # The Samba pup has no top-level downloads/, so the simple /watched/*/ loop
-      # above misses it — explicitly check for media/{downloads,inbox,documents,torrents}.
+      # above misses it — explicitly check for media subdirs.
       for pup in /storage/config/watched/*/; do
         [ -d "$pup" ] || continue
-        for sub in downloads inbox documents torrents; do
+        for sub in downloads documents torrents; do
           [ -d "$pup/media/$sub" ] && WATCH_DIRS="$WATCH_DIRS $pup/media/$sub"
         done
       done

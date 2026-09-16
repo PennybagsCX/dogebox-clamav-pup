@@ -226,7 +226,7 @@ EOF
         [ "\$s" -ge 0 ] 2>/dev/null && fc_age="\${s}s"
       fi
       local ts; ts=$($DATE -u +%FT%TZ)
-      $CAT > "$STATUS" <<JSON
+      $CAT > "$STATUS" <<'JSON'
 {"last_heartbeat":"$ts","quarantined_total":$qn,"watching":"$WATCH_DIRS","freshclam":{"status":"$fc_status","last_attempt":"$fc_last","db_age":"$fc_age"}}
 JSON
     }

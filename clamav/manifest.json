@@ -2,7 +2,7 @@
   "manifestVersion": 1,
   "meta": {
     "name": "ClamAV",
-    "version": "0.0.4",
+    "version": "0.0.5",
     "logoPath": "logo.png",
     "shortDescription": "Antivirus scanner with quarantine",
     "longDescription": "ClamAV pup for Dogebox: inotify-based real-time scan + hourly full scan of qBittorrent and *arr download dirs. Infected files are quarantined to /storage/quarantine, a status page is served at the WebUI, and signature DB updates via freshclam.",

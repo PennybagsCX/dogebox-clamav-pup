@@ -223,11 +223,10 @@ EOF
         fc_status=$($JQ -r '.status // "unknown"' "${FRESHCLAM_STATUS}" 2>/dev/null || echo unknown)
         fc_last=$($JQ -r '.last_attempt_iso // ""' "${FRESHCLAM_STATUS}" 2>/dev/null || echo "")
         local s; s=$($JQ -r '.db_age_seconds // -1' "${FRESHCLAM_STATUS}" 2>/dev/null || echo -1)
-        [ "\$s" -ge 0 ] 2>/dev/null && fc_age="''$${s}s''"
       fi
       local ts; ts=$($DATE -u +%FT%TZ)
       $CAT > "$STATUS" <<'JSON'
-{"last_heartbeat":"$ts","quarantined_total":$qn,"watching":"$WATCH_DIRS","freshclam":{"status":"$fc_status","last_attempt":"$fc_last","db_age":"$fc_age"}}
+{"last_heartbeat":"$ts","quarantined_total":$qn,"watching":"$WATCH_DIRS","freshclam":{"status":"$fc_status","last_attempt":"$fc_last"}}
 JSON
     }
 

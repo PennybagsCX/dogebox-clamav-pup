@@ -223,7 +223,7 @@ EOF
         fc_status=$($JQ -r '.status // "unknown"' "${FRESHCLAM_STATUS}" 2>/dev/null || echo unknown)
         fc_last=$($JQ -r '.last_attempt_iso // ""' "${FRESHCLAM_STATUS}" 2>/dev/null || echo "")
         local s; s=$($JQ -r '.db_age_seconds // -1' "${FRESHCLAM_STATUS}" 2>/dev/null || echo -1)
-        [ "$s" -ge 0 ] 2>/dev/null && fc_age="${s}s"
+        [ "\$s" -ge 0 ] 2>/dev/null && fc_age="\${s}s"
       fi
       local ts; ts=$($DATE -u +%FT%TZ)
       $CAT > "$STATUS" <<JSON

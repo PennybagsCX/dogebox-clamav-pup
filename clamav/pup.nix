@@ -52,9 +52,7 @@ let
     elif [ "$age" -lt 172800 ];  then st="ok"
     elif [ "$age" -lt 259200 ];  then st="stale"
     else                             st="critical"; fi
-    $CAT > "$OUT" <<JSON
-{"status":"$st","last_attempt_iso":"$($DATE -u +%FT%TZ)","db_age_seconds":$age}
-JSON
+    printf '%s\n' "{\"status\":\"$st\",\"last_attempt_iso\":\"$($DATE -u +%FT%TZ)\",\"db_age_seconds\":$age}" > "$OUT"
   '';
 
   # ---- clamd (clamav-daemon service) ---------------------------------
@@ -226,9 +224,7 @@ EOF
         [ "\$s" -ge 0 ] 2>/dev/null && fc_age="''$${s}s''"
       fi
       local ts; ts=$($DATE -u +%FT%TZ)
-      $CAT > "$STATUS" <<'JSON'
-{"last_heartbeat":"$ts","quarantined_total":$qn,"watching":"$WATCH_DIRS","freshclam":{"status":"$fc_status","last_attempt":"$fc_last","db_age":"$fc_age"}}
-JSON
+      printf '%s\n' "{\"last_heartbeat\":\"$ts\",\"quarantined_total\":$qn,\"watching\":\"$WATCH_DIRS\",\"freshclam\":{\"status\":\"$fc_status\",\"last_attempt\":\"$fc_last\",\"db_age\":\"$fc_age\"}}" > "$STATUS"
     }
 
     $ECHO '{"started":"'"$($DATE -u +%FT%TZ)"'"}' > "$STATUS"

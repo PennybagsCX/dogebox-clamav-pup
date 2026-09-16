@@ -52,7 +52,8 @@ let
     elif [ "$age" -lt 172800 ];  then st="ok"
     elif [ "$age" -lt 259200 ];  then st="stale"
     else                             st="critical"; fi
-    printf '{"status":"%s","last_attempt_iso":"%s","db_age_seconds":%s}\n' "$st" "$($DATE -u +%FT%TZ)" "$age" > "$OUT"
+    printf '{"status":"%s","last_attempt_iso":"%s","db_age_seconds":%s}' "$st" "$($DATE -u +%FT%TZ)" "$age" > "$OUT"
+    printf '\n' >> "$OUT"
   '';
 
   # ---- clamd (clamav-daemon service) ---------------------------------
@@ -224,7 +225,8 @@ EOF
         [ "\$s" -ge 0 ] 2>/dev/null && fc_age="''$${s}s''"
       fi
       local ts; ts=$($DATE -u +%FT%TZ)
-      printf '{"last_heartbeat":"%s","quarantined_total":%s,"watching":"%s","freshclam":{"status":"%s","last_attempt":"%s","db_age":"%s"}}\n' "$ts" "$qn" "$WATCH_DIRS" "$fc_status" "$fc_last" "$fc_age" > "$STATUS"
+      printf '{"last_heartbeat":"%s","quarantined_total":%s,"watching":"%s","freshclam":{"status":"%s","last_attempt":"%s","db_age":"%s"}}' "$ts" "$qn" "$WATCH_DIRS" "$fc_status" "$fc_last" "$fc_age" > "$STATUS"
+      printf '\n' >> "$STATUS"
     }
 
     $ECHO '{"started":"'"$($DATE -u +%FT%TZ)"'"}' > "$STATUS"

@@ -1,48 +1,165 @@
 { pkgs ? import <nixpkgs> {} }:
 
 # ClamAV pup for Dogebox.
-# One service that starts freshclam, then clamd, then inotify+scheduled scanner,
-# then a tiny Python status page on port 9000. All four share /storage.
+# Four independent services (clamav-daemon, clamav-scanner, clamav-freshclam, clamav-webui)
+# that share /storage and coordinate via socket + status files.
 #
-# Auto-update flow:
-#   1. On startup, check if /storage/config/clamav-db/main.{cvd,cldb} exists.
-#      - If absent OR freshness file says >24h old: run freshclam synchronously
-#        ONCE to bootstrap (this is where the box needs outbound to database.clamav.net).
-#        The result is recorded in /storage/config/freshclam.status.
-#      - If recent: skip the sync run (saves ~30s on every boot).
-#   2. Then start freshclam in --daemon mode (Checks=4 → ~6h interval).
-#   3. clamd starts once DB is present (whether from disk or the sync run).
-#   4. The webUI reads freshclam.status and shows DB age + status. A DB >48h old
-#      is flagged as "stale — outbound may be blocked"; >72h is critical.
+# Startup order (driven by systemd service deps):
+#   clamav-freshclam  → bootstrap DB, then daemonise
+#   clamav-daemon     → clamd (waits for DB via clamd.conf clamd-on-update-fork)
+#   clamav-scanner    → inotify + hourly full scan, uses clamdscan / clamscan
+#   clamav-webui      → Python status page on :9000
 #
-# Layout:
-#   /storage/config/             writable config + log dir
-#   /storage/config/clamav-db/   signature DB (managed by freshclam)
-#   /storage/config/clamd.ctl    clamd UNIX socket
-#   /storage/config/watched/     symlinks to every pup's downloads/ dir
-#   /storage/config/scanner.log  all scan events (append)
-#   /storage/config/quarantine.log   only quarantine events (append)
-#   /storage/config/freshclam.status   {last_successful_update_iso, last_attempt_iso, db_age_seconds, status: ok|stale|critical|unknown}
-#   /storage/config/status.json  live scanner status (heartbeat every 30s)
-#   /storage/quarantine/         chmod 000'd bad files
+# Storage layout:
+#   /storage/config/           config + log dir
+#   /storage/config/clamav-db/ signature DB (freshclam manages)
+#   /storage/config/clamd.ctl  clamd UNIX socket
+#   /storage/config/watched/   symlinks: <pupID> → <pupStorage>/downloads
+#   /storage/config/scanner.log
+#   /storage/config/quarantine.log
+#   /storage/config/freshclam.status
+#   /storage/config/status.json  (scanner heartbeat)
+#   /storage/quarantine/        chmod 000'd bad files
+
 let
-  app = pkgs.clamav;
+  app    = pkgs.clamav;
   inotify = pkgs.inotify-tools;
   python = pkgs.python3;
-  jq = pkgs.jq;
+  jq     = pkgs.jq;
 
-  # inotify watch list of pup download dirs is computed at runtime from
-  # /opt/dogebox/pups/storage/*/downloads. This script does the scan.
+  STATUS_JSON       = "/storage/config/status.json";
+  QUARANTINE_DIR    = "/storage/quarantine";
+  SCANNER_LOG       = "/storage/config/scanner.log";
+  QUARANTINE_LOG    = "/storage/config/quarantine.log";
+  CLAMD_SOCKET      = "/storage/config/clamd.ctl";
+  FRESHCLAM_STATUS  = "/storage/config/freshclam.status";
+  FRESHCLAM_CONF    = "/storage/config/freshclam.conf";
+  CLAMAV_DB         = "/storage/config/clamav-db";
+
+  # ---- shared helper: write freshclam status JSON --------------------
+  writeFcStatus = pkgs.writeScript "write-fc-status.sh" ''
+    #!${pkgs.stdenv.shell}
+    DATE=${pkgs.coreutils}/bin/date
+    STAT=${pkgs.coreutils}/bin/stat
+    FIND=${pkgs.findutils}/bin/find
+    CAT=${pkgs.coreutils}/bin/cat
+    DB_DIR="${CLAMAV_DB}"
+    OUT="${FRESHCLAM_STATUS}"
+    newest=$($FIND "$DB_DIR" -maxdepth 1 -type f \( -name "*.cvd" -o -name "*.cldb" \) -printf "%T@\n" 2>/dev/null | sort -nr | head -1)
+    age=-1
+    [ -n "$newest" ] && age=$(($($DATE +%s) - newest))
+    if   [ "$age" -lt 0 ];       then st="unknown"
+    elif [ "$age" -lt 172800 ];  then st="ok"
+    elif [ "$age" -lt 259200 ];  then st="stale"
+    else                             st="critical"; fi
+    $CAT > "$OUT" <<JSON
+{"status":"$st","last_attempt_iso":"$($DATE -u +%FT%TZ)","db_age_seconds":$age}
+JSON
+  '';
+
+  # ---- clamd (clamav-daemon service) ---------------------------------
+  clamdScript = pkgs.writeScript "clamd.sh" ''
+    #!${pkgs.stdenv.shell}
+    set -e
+    MKDIR=${pkgs.coreutils}/bin/mkdir
+    LN=${pkgs.coreutils}/bin/ln
+    CAT=${pkgs.coreutils}/bin/cat
+    ECHO=${pkgs.coreutils}/bin/echo
+
+    $MKDIR -p /storage/config /storage/quarantine "${CLAMAV_DB}"
+
+    # Symlink every pup's downloads/ into watched/<pupID>
+    if [ -d /opt/dogebox/pups/storage ]; then
+      for pup in /opt/dogebox/pups/storage/*/; do
+        [ -d "$pup/downloads" ] && $LN -sfn "$pup/downloads" "/storage/config/watched/$(basename "$pup")" 2>/dev/null || true
+      done
+    fi
+
+    $CAT > /storage/config/clamd.conf <<'EOF'
+LogFile /storage/config/clamd.log
+LogTime yes
+DatabaseDirectory ${CLAMAV_DB}
+LocalSocket ${CLAMD_SOCKET}
+LocalSocketMode 660
+User root
+Foreground yes
+ScanPE yes
+ScanELF yes
+ScanOLE2 yes
+ScanMail yes
+ScanArchive yes
+ArchiveBlockEncrypted no
+MaxFileSize 0
+MaxScanSize 0
+MaxRecursion 16
+MaxFiles 10000
+EOF
+
+    $ECHO "[clamd] starting..."
+    exec ${app}/bin/clamd --config-file=/storage/config/clamd.conf
+  '';
+
+  # ---- freshclam (clamav-freshclam service) -------------------------
+  freshclamScript = pkgs.writeScript "freshclam.sh" ''
+    #!${pkgs.stdenv.shell}
+    set -e
+    MKDIR=${pkgs.coreutils}/bin/mkdir
+    CAT=${pkgs.coreutils}/bin/cat
+    DATE=${pkgs.coreutils}/bin/date
+    FIND=${pkgs.findutils}/bin/find
+    SLEEP=${pkgs.coreutils}/bin/sleep
+    ECHO=${pkgs.coreutils}/bin/echo
+    TEE=${pkgs.coreutils}/bin/tee
+    WRITE_FC_STATUS=${writeFcStatus}/bin/write-fc-status.sh
+
+    $MKDIR -p "${CLAMAV_DB}"
+
+    $CAT > ${FRESHCLAM_CONF} <<'EOF'
+DatabaseDirectory ${CLAMAV_DB}
+UpdateLogFile /storage/config/freshclam.log
+DatabaseOwner root
+DatabaseMirror database.clamav.net
+Checks 4
+EOF
+
+    # Bootstrap: sync run if no DB or DB > 24 h old
+    NEED_SYNC=no
+    if [ ! -f "${CLAMAV_DB}"/main.cvd ] && [ ! -f "${CLAMAV_DB}"/main.cldb ]; then
+      NEED_SYNC=yes
+      $ECHO "[freshclam] no DB — bootstrap sync..."
+    else
+      newest=$($FIND "${CLAMAV_DB}" -maxdepth 1 -type f \( -name "*.cvd" -o -name "*.cldb" \) -printf "%T@\n" 2>/dev/null | sort -nr | head -1)
+      [ -n "$newest" ] && [ $(($($DATE +%s) - newest)) -gt 86400 ] && NEED_SYNC=yes
+    fi
+
+    if [ "$NEED_SYNC" = "yes" ]; then
+      timeout 90 ${app}/bin/freshclam --config-file=${FRESHCLAM_CONF} --no-warnings 2>&1 | $TEE -a /storage/config/freshclam.log || \
+        $ECHO "[freshclam] sync failed (exit $?) — continuing"
+    fi
+    $WRITE_FC_STATUS
+
+    # Background: refresh status every 5 min
+    (
+      while $SLEEP 300; do $WRITE_FC_STATUS; done
+    ) &
+    STATUS_PID=$!
+
+    $ECHO "[freshclam] starting daemon..."
+    exec ${app}/bin/freshclam --config-file=${FRESHCLAM_CONF} --daemon --no-warnings 2>>/storage/config/freshclam.log
+  '';
+
+  # ---- scanner (clamav-scanner service) -----------------------------
   scannerScript = pkgs.writeScript "scanner.sh" ''
     #!${pkgs.stdenv.shell}
-    QUARANTINE=/storage/quarantine
-    LOG=/storage/config/scanner.log
-    STATUS=/storage/config/status.json
+    set -e
+    QUARANTINE="${QUARANTINE_DIR}"
+    LOG="${SCANNER_LOG}"
+    STATUS="${STATUS_JSON}"
     MAX_MB=8192
     MAX_BYTES=$((MAX_MB * 1024 * 1024))
     CLAMDSCAN=${app}/bin/clamdscan
     CLAMSCAN=${app}/bin/clamscan
-    SOCKET=/storage/config/clamd.ctl
+    SOCKET="${CLAMD_SOCKET}"
     MV=${pkgs.coreutils}/bin/mv
     CHMOD=${pkgs.coreutils}/bin/chmod
     MKDIR=${pkgs.coreutils}/bin/mkdir
@@ -56,38 +173,32 @@ let
     FIND=${pkgs.findutils}/bin/find
     CAT=${pkgs.coreutils}/bin/cat
     SUDO=${pkgs.sudo}/bin/sudo
+    JQ=${jq}/bin/jq
 
     $MKDIR -p "$QUARANTINE"
 
-    # Build watch list from /opt/dogebox/pups/storage/*/downloads AND any
-    # media/downloads subdir (the Samba share exposes media/downloads as
-    # the user-writable destination from native Mac apps).
+    # Build watch list from /storage/config/watched/<pupID>/{downloads,documents,torrents}
     WATCH_DIRS=""
     if [ -d /storage/config/watched ]; then
-      for d in /storage/config/watched/*/; do
-        [ -d "$d" ] && WATCH_DIRS="$WATCH_DIRS $d"
-      done
-      # Also include the Samba pup's media/{downloads,documents,torrents} if present.
-      # The Samba pup has no top-level downloads/, so the simple /watched/*/ loop
-      # above misses it — explicitly check for media subdirs.
       for pup in /storage/config/watched/*/; do
         [ -d "$pup" ] || continue
         for sub in downloads documents torrents; do
-          [ -d "$pup/media/$sub" ] && WATCH_DIRS="$WATCH_DIRS $pup/media/$sub"
+          [ -d "$pup/$sub" ] && WATCH_DIRS="$WATCH_DIRS $pup/$sub"
         done
       done
     fi
-    $ECHO "scanner watch dirs: $WATCH_DIRS"
+    WATCH_DIRS=$(echo "$WATCH_DIRS" | tr ' ' '\n' | sort -u | tr '\n' ' ')
+    $ECHO "[scanner] watch dirs:$WATCH_DIRS"
 
     scan_file() {
       local f="$1" trigger="$2"
       [ -f "$f" ] || return 0
       case "$f" in
-        */quarantine/*|*/clamd.ctl|*/clamd.log|*/scanner.log|*/freshclam.log|*/status.json|*.quarantine) return 0;;
+        */quarantine/*|*/clamd.ctl|*/clamd.log|*/scanner.log|\
+        */freshclam.log|*/status.json|*/freshclam.status|*.quarantine) return 0;;
       esac
       local sz; sz=$($STAT -c%s "$f" 2>/dev/null || echo 0)
       [ "$sz" -gt "$MAX_BYTES" ] && { $ECHO "skip (too big): $f" >> "$LOG"; return 0; }
-
       local out
       if [ -S "$SOCKET" ]; then
         out=$($CLAMDSCAN --quiet --infected --no-summary "$f" 2>&1) || true
@@ -101,14 +212,28 @@ let
         $CHMOD 000 "$target" 2>/dev/null || true
         local ts; ts=$($DATE -u +%FT%TZ)
         $ECHO "[$ts] QUARANTINE: $f -> $target ($out) trigger=$trigger" >> "$LOG"
-        $ECHO "[$ts] QUARANTINE: $f -> $target ($out) trigger=$trigger" >> /storage/config/quarantine.log
+        $ECHO "[$ts] QUARANTINE: $f -> $target ($out) trigger=$trigger" >> "${QUARANTINE_LOG}"
       fi
     }
 
-    # Initial status
-    $ECHO '{"started":"'$($DATE -u +%FT%TZ)'","watching":""}' > "$STATUS"
+    write_status() {
+      local qn; qn=$($GREP -c '^\[' "${QUARANTINE_LOG}" 2>/dev/null || echo 0)
+      local fc_status="unknown"; local fc_age=""; local fc_last=""
+      if [ -f "${FRESHCLAM_STATUS}" ]; then
+        fc_status=$($JQ -r '.status // "unknown"' "${FRESHCLAM_STATUS}" 2>/dev/null || echo unknown)
+        fc_last=$($JQ -r '.last_attempt_iso // ""' "${FRESHCLAM_STATUS}" 2>/dev/null || echo "")
+        local s; s=$($JQ -r '.db_age_seconds // -1' "${FRESHCLAM_STATUS}" 2>/dev/null || echo -1)
+        [ "$s" -ge 0 ] 2>/dev/null && fc_age="${s}s"
+      fi
+      local ts; ts=$($DATE -u +%FT%TZ)
+      $CAT > "$STATUS" <<JSON
+{"last_heartbeat":"$ts","quarantined_total":$qn,"watching":"$WATCH_DIRS","freshclam":{"status":"$fc_status","last_attempt":"$fc_last","db_age":"$fc_age"}}
+JSON
+    }
 
-    # inotify watch (foreground — when it exits, we restart it)
+    $ECHO '{"started":"'"$($DATE -u +%FT%TZ)"'"}' > "$STATUS"
+
+    # inotify watch
     if [ -n "$WATCH_DIRS" ]; then
       $INOTIFYWAIT -m -r -e close_write,moved_to $WATCH_DIRS 2>>"$LOG" | \
         while read -r dir event file; do
@@ -117,137 +242,94 @@ let
       INO_PID=$!
     fi
 
-    # Hourly scheduled full scan
+    # Hourly full scan
     (
       while $SLEEP 3600; do
-        $ECHO "[$($DATE -u +%FT%TZ)] hourly scheduled scan starting" >> "$LOG"
+        $ECHO "[$($DATE -u +%FT%TZ)] hourly scan start" >> "$LOG"
         for d in $WATCH_DIRS; do
           $FIND "$d" -type f -size -''${MAX_MB}M 2>/dev/null | while read -r f; do
             scan_file "$f" "scheduled"
           done
         done
-        $ECHO "[$($DATE -u +%FT%TZ)] hourly scheduled scan done" >> "$LOG"
+        $ECHO "[$($DATE -u +%FT%TZ)] hourly scan done" >> "$LOG"
       done
     ) &
     SCHED_PID=$!
 
-    # Heartbeat: every 30s update status.json
+    # Heartbeat
     (
-      while $SLEEP 30; do
-        local qn; qn=$($GREP -c '^\[' /storage/config/quarantine.log 2>/dev/null || echo 0)
-        local ts; ts=$($DATE -u +%FT%TZ)
-        # Read freshclam status (written by the freshclam wrapper in run.sh)
-        local fc_status="unknown"; local fc_last_iso=""; local fc_db_age=""
-        if [ -f /storage/config/freshclam.status ]; then
-          fc_status=$(${jq}/bin/jq -r '.status // "unknown"' /storage/config/freshclam.status 2>/dev/null || echo unknown)
-          fc_last_iso=$(${jq}/bin/jq -r '.last_successful_update_iso // ""' /storage/config/freshclam.status 2>/dev/null || echo "")
-          local db_age_seconds=$(${jq}/bin/jq -r '.db_age_seconds // -1' /storage/config/freshclam.status 2>/dev/null || echo -1)
-          if [ "$db_age_seconds" -ge 0 ]; then
-            local hours=$((db_age_seconds / 3600))
-            fc_db_age="''${hours}h"
-          else
-            fc_db_age="unknown"
-          fi
-        fi
-        $CAT > "$STATUS" <<JSON
-    {"last_heartbeat":"$ts","quarantined_total":$qn,"log":"/storage/config/scanner.log","watching":"$WATCH_DIRS","freshclam":{"status":"$fc_status","last_successful_update":"$fc_last_iso","db_age":"$fc_db_age"}}
-    JSON
-      done
+      while $SLEEP 30; do write_status; done
     ) &
     HB_PID=$!
 
     wait $INO_PID $SCHED_PID $HB_PID
   '';
 
-  # Minimal Python stdlib status page
+  # ---- webui (clamav-webui service) ---------------------------------
   webuiScript = pkgs.writeText "webui.py" ''
     import http.server, json, sys, os
     from urllib.parse import urlparse, parse_qs
 
-    STATUS_FILE = sys.argv[1]
-    LOG_FILE = sys.argv[2]
-    FRESHCLAM_LOG_FILE = sys.argv[3] if len(sys.argv) > 3 else "/storage/config/freshclam.log"
-    FRESHCLAM_STATUS_FILE = "/storage/config/freshclam.status"
+    STATUS_FILE    = sys.argv[1]
+    QUARANTINE_LOG = sys.argv[2]
+    FC_STATUS_FILE = "${FRESHCLAM_STATUS}"
 
-    def _read_freshclam():
+    def _fc():
         try:
-            with open(FRESHCLAM_STATUS_FILE) as f:
+            with open(FC_STATUS_FILE) as f:
                 return json.load(f)
         except Exception:
             return {"status": "unknown"}
 
-    class Handler(http.server.BaseHTTPRequestHandler):
+    class H(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
             if self.path == "/json":
                 try:
                     body = open(STATUS_FILE).read().encode()
                 except Exception as e:
                     body = ('{"error":"' + str(e) + '"}').encode()
-                self._send(200, "application/json", body)
-                return
+                self._send(200, "application/json", body); return
             if self.path == "/freshclam":
-                self._send(200, "application/json", json.dumps(_read_freshclam()).encode())
-                return
+                self._send(200, "application/json", json.dumps(_fc()).encode()); return
             if self.path.startswith("/raw"):
                 n = int(parse_qs(urlparse(self.path).query).get("lines", ["100"])[0])
                 try:
-                    lines = open(LOG_FILE).readlines()[-n:]
+                    lines = open(QUARANTINE_LOG).readlines()[-n:]
                     body = "".join(lines).encode()
                 except FileNotFoundError:
-                    body = b"(no quarantine events yet)"
-                self._send(200, "text/plain", body)
-                return
+                    body = b"(no events yet)"
+                self._send(200, "text/plain", body); return
             try:
                 body = open(STATUS_FILE).read()
             except Exception:
                 body = '{"error":"no status yet"}'
-            fc = _read_freshclam()
-            fc_status = fc.get("status", "unknown")
-            fc_age = fc.get("db_age_seconds", -1)
-            fc_last = fc.get("last_successful_update_iso", "")
-            color_map = {"ok": "#0a0", "stale": "#c80", "critical": "#c00", "unknown": "#888"}
-            color = color_map.get(fc_status, "#888")
-            if fc_age is None or fc_age < 0:
-                age_str = "unknown"
-            elif fc_age < 3600:
-                age_str = str(fc_age // 60) + " min"
-            else:
-                age_str = str(fc_age // 3600) + " h"
+            fc = _fc()
+            s = fc.get("status","unknown")
+            age = fc.get("db_age_seconds", -1)
+            last = fc.get("last_attempt_iso","")
+            age_str = f"{age//3600}h" if age >= 0 else "unknown"
             hint = ""
-            if fc_status == "critical":
-                hint = ("<p style='color:#c00'><b>Critical:</b> signature DB is over 72h old. "
-                        "Likely cause: outbound blocked. Check /storage/config/freshclam.log and "
-                        "allow outbound HTTPS to database.clamav.net, or the scanner will only catch "
-                        "older known signatures.</p>")
-            elif fc_status == "stale":
-                hint = ("<p style='color:#c80'><b>Stale:</b> signature DB is over 48h old. "
-                        "freshclam likely failed to reach the update mirror.</p>")
+            if s == "critical":
+                hint = "<p style='color:#c00'><b>Critical:</b> DB &gt;72 h — outbound may be blocked.</p>"
+            elif s == "stale":
+                hint = "<p style='color:#c80'><b>Stale:</b> DB &gt;48 h old.</p>"
             html = (
-                "<!doctype html><html><head><title>ClamAV pup status</title>"
+                "<!doctype html><html><head><title>ClamAV pup</title>"
                 "<meta charset='utf-8'>"
                 "<style>"
-                "body{font-family:system-ui;margin:2rem;max-width:920px}"
+                "body{font-family:system-ui;margin:2rem;max-width:900px}"
                 "pre{background:#111;color:#0f0;padding:1rem;border-radius:.5rem;overflow:auto}"
                 ".badge{display:inline-block;padding:.25rem .75rem;border-radius:1rem;color:#fff;font-weight:600}"
-                ".badge.ok{background:#0a0}.badge.stale{background:#c80}.badge.critical{background:#c00}.badge.unknown{background:#888}"
+                ".ok{background:#0a0}.stale{background:#c80}.critical{background:#c00}.unknown{background:#888}"
                 "a{color:#08f}"
                 "</style></head>"
                 "<body><h1>ClamAV pup</h1>"
-                "<p><a href='/json'>status JSON</a> &middot; "
-                "<a href='/freshclam'>freshclam JSON</a> &middot; "
-                "<a href='/raw?lines=50'>recent log</a></p>"
-                "<h2>Signature DB freshness</h2>"
-                "<p><span class='badge " + fc_status + "'>" + fc_status.upper() + "</span> &middot; "
-                "age: <b>" + age_str + "</b> &middot; last update: <b>" + (fc_last or "unknown") + "</b></p>"
-                + hint +
-                "<h2>Scanner status</h2><pre id='status'>" + body.replace("<","&lt;") + "</pre>"
-                "<h2>Recent quarantine events</h2><pre id='log'>"
-                "(see /raw?lines=200)</pre>"
-                "<script>"
-                "fetch('/json').then(r=>r.text()).then(t=>{document.getElementById('status').textContent=t})"
-                ".catch(e=>{document.getElementById('status').textContent='err: '+e})"
-                "fetch('/raw?lines=20').then(r=>r.text()).then(t=>{document.getElementById('log').textContent=t})"
-                "</script></body></html>"
+                "<p><a href='/json'>JSON</a> &middot; <a href='/freshclam'>freshclam</a> &middot; <a href='/raw?lines=50'>log</a></p>"
+                "<h2>Signature DB</h2>"
+                "<p><span class='badge "+s+"'>"+s.upper()+"</span> age:<b>"+age_str+"</b> last:<b>"+(last or "—")+"</b></p>"+hint
+                "<h2>Scanner</h2><pre id='s'></pre>"
+                "<script>fetch('/json').then(r=>r.text()).then(t=>{document.getElementById('s').textContent=t})</script>"
+                "</body></html>"
             ).encode()
             self._send(200, "text/html; charset=utf-8", html)
 
@@ -257,201 +339,20 @@ let
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        def log_message(self, *a, **k): pass
 
-        def log_message(self, *args, **kwargs):
-            pass
-
-    port = int(sys.argv[4])
-    TS = getattr(http.server, "ThreadingHTTPServer", None) or http.server.ThreadingTCPServer
-    with TS(("0.0.0.0", port), Handler) as s:
-        s.allow_reuse_address = True
-        s.serve_forever()
-  '';
-
-  runScript = pkgs.writeScriptBin "run.sh" ''
-    #!${pkgs.stdenv.shell}
-    set -e
-    export HOME=/storage/config
-    MKDIR=${pkgs.coreutils}/bin/mkdir
-    LN=${pkgs.coreutils}/bin/ln
-    CAT=${pkgs.coreutils}/bin/cat
-    SLEEP=${pkgs.coreutils}/bin/sleep
-    ECHO=${pkgs.coreutils}/bin/echo
-    DATE=${pkgs.coreutils}/bin/date
-    TOUCH=${pkgs.coreutils}/bin/touch
-    FIND=${pkgs.findutils}/bin/find
-    STAT=${pkgs.coreutils}/bin/stat
-    GREP=${pkgs.gnugrep}/bin/grep
-    TEE=${pkgs.coreutils}/bin/tee
-    JQ=${jq}/bin/jq
-
-    $MKDIR -p /storage/config /storage/quarantine /storage/config/clamav-db /storage/config/watched
-
-    # Symlink every pup's downloads/ into /storage/config/watched/<pupID>
-    if [ -d /opt/dogebox/pups/storage ]; then
-      for pup in /opt/dogebox/pups/storage/*/; do
-        [ -d "$pup/downloads" ] || continue
-        $LN -sfn "$pup/downloads" "/storage/config/watched/$(basename "$pup")" 2>/dev/null || true
-      done
-    fi
-
-    # freshclam config
-    $CAT > /storage/config/freshclam.conf <<EOF
-    DatabaseDirectory /storage/config/clamav-db
-    UpdateLogFile /storage/config/freshclam.log
-    DatabaseOwner root
-    DatabaseMirror database.clamav.net
-    Checks 4
-    NotifyClamd /storage/config/clamd.conf
-    EOF
-
-    # Helper: write freshclam status JSON with current freshness heuristic.
-    # Reads the most recent successful update from /storage/config/freshclam.log.
-    write_freshclam_status() {
-      local last_iso=""
-      # freshclam logs look like: "ClamAV update process started at Tue Sep 14 20:00:00 2026"
-      # and on success: "main.cvd updated (version: 62, sigs: ...)"
-      # Simpler: track the mtime of the newest cvd/clvd file in the DB dir.
-      local newest_db
-      newest_db=$($FIND /storage/config/clamav-db -maxdepth 1 -type f \( -name "*.cvd" -o -name "*.cldb" \) -printf "%T@ %p\n" 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)
-      local now_epoch=$($DATE +%s)
-      local db_age=-1
-      if [ -n "$newest_db" ] && [ -f "$newest_db" ]; then
-        local db_mtime=$($STAT -c %Y "$newest_db")
-        db_age=$((now_epoch - db_mtime))
-      fi
-      # Try to extract last success from freshclam.log
-      if [ -f /storage/config/freshclam.log ]; then
-        last_iso=$($GREP -oE "[A-Z][a-z]+ [A-Z][a-z]+ +[0-9]+ +[0-9]+:[0-9]+:[0-9]+ [0-9]+" /storage/config/freshclam.log 2>/dev/null | tail -1 || true)
-        if [ -z "$last_iso" ]; then
-          if [ -f /storage/config/clamav-db/main.cvd ]; then
-            last_iso=$($STAT -c %y /storage/config/clamav-db/main.cvd 2>/dev/null || true)
-          elif [ -f /storage/config/clamav-db/main.cldb ]; then
-            last_iso=$($STAT -c %y /storage/config/clamav-db/main.cldb 2>/dev/null || true)
-          fi
-        fi
-      fi
-      local status_str
-      if [ "$db_age" -lt 0 ]; then
-        status_str="unknown"
-      elif [ "$db_age" -lt 172800 ]; then
-        status_str="ok"
-      elif [ "$db_age" -lt 259200 ]; then
-        status_str="stale"
-      else
-        status_str="critical"
-      fi
-      $CAT > /storage/config/freshclam.status <<JSON
-    {"status":"$status_str","last_successful_update_iso":"$last_iso","last_attempt_iso":"$($DATE -u +%FT%TZ)","db_age_seconds":$db_age}
-    JSON
-    }
-
-    # Decide if we need a synchronous freshclam run.
-    DB_NEEDS_UPDATE=no
-    if [ ! -f /storage/config/clamav-db/main.cvd ] && [ ! -f /storage/config/clamav-db/main.cldb ]; then
-      DB_NEEDS_UPDATE=yes
-      $ECHO "[clamav-pup] no signature DB found, will bootstrap"
-    else
-      # Check freshness — if >24h old, force a sync run
-      local newest_db db_mtime_epoch db_age
-      newest_db=$($FIND /storage/config/clamav-db -maxdepth 1 -type f \( -name "*.cvd" -o -name "*.cldb" \) -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f1)
-      if [ -n "$newest_db" ]; then
-        db_mtime_epoch=$newest_db
-        db_age=$(( $($DATE +%s) - db_mtime_epoch ))
-        if [ "$db_age" -gt 86400 ]; then
-          DB_NEEDS_UPDATE=yes
-          $ECHO "[clamav-pup] DB is $((db_age/3600))h old, will refresh"
-        else
-          $ECHO "[clamav-pup] DB is recent ($((db_age/3600))h), daemon-only mode"
-        fi
-      fi
-    fi
-
-    # Sync freshclam run (only on first boot or stale DB; bounded by a timeout).
-    if [ "$DB_NEEDS_UPDATE" = "yes" ]; then
-      $ECHO "[clamav-pup] running freshclam (sync, 60s timeout, may fail if no outbound)..."
-      timeout 60 ${app}/bin/freshclam --config-file=/storage/config/freshclam.conf --no-warnings 2>&1 | $TEE -a /storage/config/freshclam.log || {
-        rc=$?
-        $ECHO "[clamav-pup] freshclam sync failed (exit $rc) — likely no outbound; clamd will start with whatever DB is present"
-      }
-    fi
-
-    # Write initial status JSON
-    write_freshclam_status
-
-    # Start freshclam daemon (4x/day checks)
-    ${app}/bin/freshclam --config-file=/storage/config/freshclam.conf --daemon --no-warnings 2>>/storage/config/freshclam.log &
-    FRESHCLAM_PID=$!
-
-    # Wait for signature DB to be present
-    $ECHO "[clamav-pup] waiting for signature DB..."
-    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-      if [ -f /storage/config/clamav-db/main.cvd ] || [ -f /storage/config/clamav-db/main.cldb ]; then
-        $ECHO "[clamav-pup] DB ready after $i attempts"
-        break
-      fi
-      $SLEEP 2
-    done
-    write_freshclam_status
-
-    # clamd config
-    $CAT > /storage/config/clamd.conf <<EOF
-    LogFile /storage/config/clamd.log
-    LogTime yes
-    DatabaseDirectory /storage/config/clamav-db
-    LocalSocket /storage/config/clamd.ctl
-    LocalSocketMode 660
-    User root
-    Foreground yes
-    ScanPE yes
-    ScanELF yes
-    ScanOLE2 yes
-    ScanMail yes
-    ScanArchive yes
-    ArchiveBlockEncrypted no
-    MaxFileSize 0
-    MaxScanSize 0
-    MaxRecursion 16
-    MaxFiles 10000
-    EOF
-
-    # Start clamd in background
-    ${app}/bin/clamd --config-file=/storage/config/clamd.conf 2>>/storage/config/clamd.log &
-    CLAMD_PID=$!
-
-    # Wait for clamd socket
-    for i in 1 2 3 4 5 6 7 8 9 10; do
-      [ -S /storage/config/clamd.ctl ] && break
-      $SLEEP 1
-    done
-    if [ ! -S /storage/config/clamd.ctl ]; then
-      $ECHO "[clamav-pup] WARN: clamd not up; scanner will fall back to clamscan"
-    else
-      $ECHO "[clamav-pup] clamd ready"
-    fi
-
-    # Start scanner
-    ${scannerScript} &
-    SCANNER_PID=$!
-
-    # Start webui
-    ${python}/bin/python3 ${webuiScript} /storage/config/status.json /storage/config/quarantine.log /storage/config/freshclam.log 9000 &
-    WEBUI_PID=$!
-
-    # Background task: refresh freshclam.status every 5min so the webUI stays current
-    (
-      while $SLEEP 300; do
-        write_freshclam_status
-      done
-    ) &
-    FCSTATUS_PID=$!
-
-    # Wait for any child to die
-    wait -n 2>/dev/null || true
-    kill $FRESHCLAM_PID $CLAMD_PID $SCANNER_PID $WEBUI_PID $FCSTATUS_PID 2>/dev/null || true
+    port = int(sys.argv[3]) if len(sys.argv) > 3 else 9000
+    TS = getattr(http.server, "ThreadingHTTPServer", None) or http.server.HTTPServer
+    with TS(("0.0.0.0", port), H) as srv:
+        srv.allow_reuse_address = True
+        srv.serve_forever()
   '';
 
 in
 {
-  clamav = runScript;
+  # Each attr name must match the service "name" in manifest.json
+  "clamav-daemon"    = pkgs.writeScriptBin "run-clamd.sh"     '' exec ${clamdScript} '';
+  "clamav-freshclam" = pkgs.writeScriptBin "run-freshclam.sh" '' exec ${freshclamScript} '';
+  "clamav-scanner"   = pkgs.writeScriptBin "run-scanner.sh"   '' exec ${scannerScript} '';
+  "clamav-webui"     = pkgs.writeScriptBin "run-webui.sh"     '' exec ${python}/bin/python3 ${webuiScript} ${STATUS_JSON} ${QUARANTINE_LOG} 9000 '';
 }

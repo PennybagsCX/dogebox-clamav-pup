@@ -39,7 +39,7 @@ When ClamAV flags a file:
 
 To **review** a quarantined file later (it stays chmod 000):
 ```bash
-ssh shibe@10.0.0.98
+ssh shibe@<dogebox-ip>
 sudo ls /opt/dogebox/pups/storage/<pup-storage-dir>/quarantine/    # list
 sudo chmod 400 /opt/dogebox/pups/storage/<...>/quarantine/file.quarantine
 # Inspect it however you like, then re-quarantine:

@@ -2,7 +2,7 @@
   "manifestVersion": 1,
   "meta": {
     "name": "ClamAV",
-    "version": "0.0.17",
+    "version": "0.0.18",
     "logoPath": "logo.png",
     "shortDescription": "Antivirus scanner with quarantine",
     "longDescription": "ClamAV pup for Dogebox: inotify-based real-time scan + hourly full scan of qBittorrent and *arr download dirs. Infected files are quarantined to /storage/quarantine, a status page is served at the WebUI, and signature DB updates via freshclam.",
@@ -16,7 +16,7 @@
   "container": {
     "build": {
       "nixFile": "pup.nix",
-      "nixFileSha256": "10bbe5afdc66f6237d34a5f2f80b44d549ee780098a45c0a42974f8ff981c2da"
+      "nixFileSha256": "08e7f707dfde5c93b3d7da772863164221e11c790ebcb76f0408b66a06b23190"
     },
     "services": [
       {

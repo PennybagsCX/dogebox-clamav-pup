@@ -65,6 +65,8 @@ JSON
     LN=${pkgs.coreutils}/bin/ln
     CAT=${pkgs.coreutils}/bin/cat
     ECHO=${pkgs.coreutils}/bin/echo
+    FIND=${pkgs.findutils}/bin/find
+    SLEEP=${pkgs.coreutils}/bin/sleep
 
     $MKDIR -p /storage/config /storage/quarantine "${CLAMAV_DB}"
 
@@ -94,6 +96,18 @@ MaxScanSize 0
 MaxRecursion 16
 MaxFiles 10000
 EOF
+
+    # clamd exits rc=1 on an empty DB dir ("No supported database files found"),
+    # and rapid restarts trip systemd's StartLimitBurst before freshclam's first
+    # download finishes. Wait (staying in "activating", which does not count
+    # against the burst) for up to 15 min, then start regardless.
+    WAITED=0
+    until [ -n "$($FIND "${CLAMAV_DB}" -maxdepth 1 -type f \( -name '*.cvd' -o -name '*.cldb' \) -print -quit 2>/dev/null)" ]; do
+      [ "$WAITED" -ge 900 ] && { $ECHO "[clamd] no DB after ''${WAITED}s — starting anyway"; break; }
+      $ECHO "[clamd] waiting for freshclam to fetch the signature DB (''${WAITED}s)..."
+      $SLEEP 10
+      WAITED=$((WAITED + 10))
+    done
 
     $ECHO "[clamd] starting..."
     exec ${app}/bin/clamd --config-file=/storage/config/clamd.conf
@@ -133,7 +147,7 @@ EOF
     fi
 
     if [ "$NEED_SYNC" = "yes" ]; then
-      timeout 90 ${app}/bin/freshclam --config-file=${FRESHCLAM_CONF} --no-warnings 2>&1 | $TEE -a /storage/config/freshclam.log || \
+      timeout 300 ${app}/bin/freshclam --config-file=${FRESHCLAM_CONF} --no-warnings 2>&1 | $TEE -a /storage/config/freshclam.log || \
         $ECHO "[freshclam] sync failed (exit $?) — continuing"
     fi
     $WRITE_FC_STATUS
@@ -350,8 +364,22 @@ JSON
 in
 {
   # Each attr name must match the service "name" in manifest.json
-  "clamav-daemon"    = pkgs.writeScriptBin "run-clamd.sh"     '' exec ${clamdScript} '';
-  "clamav-freshclam" = pkgs.writeScriptBin "run-freshclam.sh" '' exec ${freshclamScript} '';
-  "clamav-scanner"   = pkgs.writeScriptBin "run-scanner.sh"   '' exec ${scannerScript} '';
-  "clamav-webui"     = pkgs.writeScriptBin "run-webui.sh"     '' exec ${python}/bin/python3 ${webuiScript} ${STATUS_JSON} ${QUARANTINE_LOG} 9000 '';
+  # NOTE: writeScriptBin does NOT prepend a shebang — it writes the text verbatim.
+  # systemd execve()s these files raw, so a missing "#!" = ENOEXEC = 203/EXEC.
+  "clamav-daemon"    = pkgs.writeScriptBin "run-clamd.sh" ''
+    #!${pkgs.stdenv.shell}
+    exec ${clamdScript}
+  '';
+  "clamav-freshclam" = pkgs.writeScriptBin "run-freshclam.sh" ''
+    #!${pkgs.stdenv.shell}
+    exec ${freshclamScript}
+  '';
+  "clamav-scanner"   = pkgs.writeScriptBin "run-scanner.sh" ''
+    #!${pkgs.stdenv.shell}
+    exec ${scannerScript}
+  '';
+  "clamav-webui"     = pkgs.writeScriptBin "run-webui.sh" ''
+    #!${pkgs.stdenv.shell}
+    exec ${python}/bin/python3 ${webuiScript} ${STATUS_JSON} ${QUARANTINE_LOG} 9000
+  '';
 }

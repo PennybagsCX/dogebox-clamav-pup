@@ -46,6 +46,8 @@ let
     DB_DIR="${CLAMAV_DB}"
     OUT="${FRESHCLAM_STATUS}"
     newest=$($FIND "$DB_DIR" -maxdepth 1 -type f \( -name "*.cvd" -o -name "*.cldb" \) -printf "%T@\n" 2>/dev/null | sort -nr | head -1)
+    # %T@ is a float (e.g. 1789634784.356...) — bash $(( )) rejects floats; truncate to seconds
+    newest=''${newest%%.*}
     age=-1
     [ -n "$newest" ] && age=$(($($DATE +%s) - newest))
     if   [ "$age" -lt 0 ];       then st="unknown"
@@ -124,7 +126,8 @@ EOF
     SLEEP=${pkgs.coreutils}/bin/sleep
     ECHO=${pkgs.coreutils}/bin/echo
     TEE=${pkgs.coreutils}/bin/tee
-    WRITE_FC_STATUS=${writeFcStatus}/bin/write-fc-status.sh
+    # writeScript produces a single store FILE (no bin/ subdir) — use the path directly
+    WRITE_FC_STATUS=${writeFcStatus}
 
     $MKDIR -p "${CLAMAV_DB}"
 
@@ -143,6 +146,8 @@ EOF
       $ECHO "[freshclam] no DB — bootstrap sync..."
     else
       newest=$($FIND "${CLAMAV_DB}" -maxdepth 1 -type f \( -name "*.cvd" -o -name "*.cldb" \) -printf "%T@\n" 2>/dev/null | sort -nr | head -1)
+      # %T@ is a float — truncate to whole seconds before bash arithmetic
+      newest=''${newest%%.*}
       [ -n "$newest" ] && [ $(($($DATE +%s) - newest)) -gt 86400 ] && NEED_SYNC=yes
     fi
 
@@ -339,8 +344,9 @@ JSON
                 "<body><h1>ClamAV pup</h1>"
                 "<p><a href='/json'>JSON</a> &middot; <a href='/freshclam'>freshclam</a> &middot; <a href='/raw?lines=50'>log</a></p>"
                 "<h2>Signature DB</h2>"
-                "<p><span class='badge "+s+"'>"+s.upper()+"</span> age:<b>"+age_str+"</b> last:<b>"+(last or "—")+"</b></p>"+hint
-                "<h2>Scanner</h2><pre id='s'></pre>"
+                "<p><span class='badge "+s+"'>"+s.upper()+"</span> age:<b>"+age_str+"</b> last:<b>"+(last or "—")+"</b></p>"
+                +hint
+                +"<h2>Scanner</h2><pre id='s'></pre>"
                 "<script>fetch('/json').then(r=>r.text()).then(t=>{document.getElementById('s').textContent=t})</script>"
                 "</body></html>"
             ).encode()

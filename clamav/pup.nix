@@ -137,6 +137,9 @@ UpdateLogFile /storage/config/freshclam.log
 DatabaseOwner root
 DatabaseMirror database.clamav.net
 Checks 4
+# freshclam --daemon double-forks by default (parent exits 0); under systemd
+# that reads as "main process exited" and trips Restart=always → start-limit.
+Foreground yes
 EOF
 
     # Bootstrap: sync run if no DB or DB > 24 h old
@@ -244,7 +247,8 @@ EOF
         local s; s=$($JQ -r '.db_age_seconds // -1' "${FRESHCLAM_STATUS}" 2>/dev/null || echo -1)
       fi
       local ts; ts=$($DATE -u +%FT%TZ)
-      $CAT > "$STATUS" <<'JSON'
+      # unquoted delimiter: $ts/$qn/... must expand (body has no $( or backticks)
+      $CAT > "$STATUS" <<JSON
 {"last_heartbeat":"$ts","quarantined_total":$qn,"watching":"$WATCH_DIRS","freshclam":{"status":"$fc_status","last_attempt":"$fc_last"}}
 JSON
     }
